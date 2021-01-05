@@ -1,0 +1,97 @@
+UBI version:                    1
+Count of UBI devices:           1
+UBI control device major/minor: 10:127
+Present UBI devices:            ubi0
+
+ubi0
+Volumes count:                           10
+Logical eraseblock size:                 126976 bytes, 124.0 KiB
+Total amount of logical eraseblocks:     2048 (260046848 bytes, 248.0 MiB)
+Amount of available logical eraseblocks: 418 (53075968 bytes, 50.6 MiB)
+Maximum count of volumes                 128
+Count of bad physical eraseblocks:       0
+Count of reserved physical eraseblocks:  40
+Current maximum erase counter value:     42
+Minimum input/output unit size:          2048 bytes
+Character device major/minor:            247:0
+Present volumes:                         0, 1, 2, 3, 4, 5, 6, 7, 8, 9
+
+Volume ID:   0 (on ubi0)
+Type:        dynamic
+Alignment:   1
+Size:        37 LEBs (4698112 bytes, 4.4 MiB)
+State:       OK
+Name:        kernel2
+Character device major/minor: 247:1
+-----------------------------------
+Volume ID:   1 (on ubi0)
+Type:        dynamic
+Alignment:   1
+Size:        158 LEBs (20062208 bytes, 19.1 MiB)
+State:       OK
+Name:        rootfs2
+Character device major/minor: 247:2
+-----------------------------------
+Volume ID:   2 (on ubi0)
+Type:        dynamic
+Alignment:   1
+Size:        9 LEBs (1142784 bytes, 1.0 MiB)
+State:       OK
+Name:        cfg2
+Character device major/minor: 247:3
+-----------------------------------
+Volume ID:   3 (on ubi0)
+Type:        dynamic
+Alignment:   1
+Size:        9 LEBs (1142784 bytes, 1.0 MiB)
+State:       OK
+Name:        cfg
+Character device major/minor: 247:4
+-----------------------------------
+Volume ID:   4 (on ubi0)
+Type:        dynamic
+Alignment:   1
+Size:        37 LEBs (4698112 bytes, 4.4 MiB)
+State:       OK
+Name:        kernel
+Character device major/minor: 247:5
+-----------------------------------
+Volume ID:   5 (on ubi0)
+Type:        dynamic
+Alignment:   1
+Size:        158 LEBs (20062208 bytes, 19.1 MiB)
+State:       OK
+Name:        rootfs
+Character device major/minor: 247:6
+-----------------------------------
+Volume ID:   6 (on ubi0)
+Type:        dynamic
+Alignment:   1
+Size:        958 LEBs (121643008 bytes, 116.0 MiB)
+State:       OK
+Name:        stats
+Character device major/minor: 247:7
+-----------------------------------
+Volume ID:   7 (on ubi0)
+Type:        dynamic
+Alignment:   1
+Size:        33 LEBs (4190208 bytes, 3.9 MiB)
+State:       OK
+Name:        kernel_recovery
+Character device major/minor: 247:8
+-----------------------------------
+Volume ID:   8 (on ubi0)
+Type:        dynamic
+Alignment:   1
+Size:        95 LEBs (12062720 bytes, 11.5 MiB)
+State:       OK
+Name:        rootfs_recovery
+Character device major/minor: 247:9
+-----------------------------------
+Volume ID:   9 (on ubi0)
+Type:        dynamic
+Alignment:   1
+Size:        92 LEBs (11681792 bytes, 11.1 MiB)
+State:       OK
+Name:        lcm
+Character device major/minor: 247:10
