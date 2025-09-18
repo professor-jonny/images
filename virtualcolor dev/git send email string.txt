@@ -1,0 +1,3 @@
+git format-patch --cover-letter --base=lee-leds/for-leds-next -7 -v6
+
+git send-email --dry-run --to 'lee Jones <lee@kernel.org>' --to 'Pavel Machek <pavel@kernel.org>' --to 'Andriy Shevencho <andriy.shevchenko@linux.intel.com>' --to 'Jonathan Brophy <professor_jonny@hotmail.com>' --to 'Rob Herring <robh@kernel.org>' --to 'Krzysztof Kozlowski <krzk+dt@kernel.org>' --to 'Conor Dooley <conor+dt@kernel.org>' --to 'Radoslav Tsvetkov <rtsvetkov@gradotech.eu>' --cc 'devicetree@vger.kernel.org' --cc 'linux-kernel@vger.kernel.org' --cc 'linux-leds@vger.kernel.org' --confirm=always v1* ./patch/*.patch

@@ -1,0 +1,117 @@
+--- a/drivers/leds/led-class.c
++++ b/drivers/leds/led-class.c
+@@ -271,6 +271,102 @@
+ }
+ EXPORT_SYMBOL_GPL(of_led_get);
+
++
++/**
++ * fwnode_led_get() - Get LED class device from firmware node reference
++ * @fwnode: Firmware node containing LED phandle array property
++ * @index: Index within the LED array property
++ * @out_dev: Optional output for the LED's parent device (may be NULL)
++ *
++ * This function resolves LED class devices from firmware node references,
++ * providing a firmware-agnostic alternative to of_led_get(). It supports
++ * both Device Tree and ACPI systems.
++ *
++ * The function handles:
++ * - GPIO LEDs (which don't have struct device)
++ * - Platform LED controllers
++ * - Deferred probing via -EPROBE_DEFER
++ * - Reference counting via led_module_get()
++ *
++ * If @out_dev is non-NULL and the LED has a parent device, a reference
++ * to that device is returned via get_device(). The caller is responsible
++ * for calling put_device() when done. GPIO LEDs may not have a parent
++ * device, in which case @out_dev will be set to NULL.
++ *
++ * The caller must call led_put() on the returned LED class device when done.
++ *
++ * Return: LED class device pointer on success, ERR_PTR on error:
++ *         -EPROBE_DEFER if LED provider is not yet available
++ *         -EINVAL for invalid arguments or missing LED
++ *         -ENODEV if LED provider returned NULL
++ */
++struct led_classdev *fwnode_led_get(const struct fwnode_handle *fwnode,
++				    int index,
++				    struct device **out_dev)
++{
++	struct fwnode_reference_args args;
++	struct led_classdev *cdev;
++	struct device *led_dev = NULL;
++	int ret;
++
++	if (out_dev)
++		*out_dev = NULL;
++
++	if (!fwnode)
++		return ERR_PTR(-EINVAL);
++
++	/* Get the LED reference from the firmware node */
++	ret = fwnode_property_get_reference_args(fwnode, "leds", NULL, 0,
++						 index, &args);
++	if (ret)
++		return ERR_PTR(ret);
++
++	/*
++	 * Try Device Tree path first if this is an OF node.
++	 * This handles GPIO LEDs and other DT-specific LED providers.
++	 */
++	if (is_of_node(args.fwnode)) {
++		struct device_node *np = to_of_node(args.fwnode);
++
++		cdev = of_led_get(np, 0);
++		fwnode_handle_put(args.fwnode);
++
++		if (IS_ERR(cdev))
++			return cdev;
++
++		/* Get parent device if it exists */
++		if (out_dev && cdev->dev)
++			*out_dev = get_device(cdev->dev);
++
++		return cdev;
++	}
++
++	/*
++	 * ACPI or generic fwnode path.
++	 * Try to find the LED class device by matching the fwnode.
++	 */
++	led_dev = fwnode_get_next_parent_dev((struct fwnode_handle *)args.fwnode);
++	fwnode_handle_put(args.fwnode);
++
++	if (!led_dev)
++		return ERR_PTR(-EPROBE_DEFER);
++
++	/* Find the LED class device associated with this device */
++	cdev = led_module_get(led_dev);
++	if (!cdev) {
++		put_device(led_dev);
++		return ERR_PTR(-EPROBE_DEFER);
++	}
++
++	if (out_dev)
++		*out_dev = led_dev;
++	else
++		put_device(led_dev);
++
++	return cdev;
++}
++EXPORT_SYMBOL_GPL(fwnode_led_get);
++
+ /**
+  * led_put() - release a LED device
+  * @led_cdev: LED device
+--- a/include/linux/leds.h
++++ b/include/linux/leds.h
+@@ -295,6 +295,9 @@
+
+ extern struct led_classdev *of_led_get(struct device_node *np, int index);
+ extern void led_put(struct led_classdev *led_cdev);
++extern struct led_classdev *fwnode_led_get(const struct fwnode_handle *fwnode,
++					   int index,
++					   struct device **out_dev);
+ struct led_classdev *__must_check devm_of_led_get(struct device *dev,
+ 						  int index);
+ struct led_classdev *__must_check devm_of_led_get_optional(struct device *dev,

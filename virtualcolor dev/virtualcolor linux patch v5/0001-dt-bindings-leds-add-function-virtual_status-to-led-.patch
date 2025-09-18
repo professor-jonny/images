@@ -1,0 +1,29 @@
+From de42443154445a9a53d605ccf393724ad2a4fd03 Mon Sep 17 00:00:00 2001
+From: Jonathan Brophy <professor_jonny@hotmail.com>
+Date: Mon, 29 Dec 2025 22:59:54 +1300
+Subject: [PATCH v5 1/7] dt-bindings: leds: add function virtual_status to led common properties
+
+LED-FUNCTION-VIRTUAL-STATUS ID to the FUNCTION ID list for device tree
+bindings to suit virtual led drivers.
+
+Signed-off-by: Jonathan Brophy <professor_jonny@hotmail.com>
+---
+ include/dt-bindings/leds/common.h | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/include/dt-bindings/leds/common.h b/include/dt-bindings/leds/common.h
+index 4f017bea0123..f03214ba28d5 100644
+--- a/include/dt-bindings/leds/common.h
++++ b/include/dt-bindings/leds/common.h
+@@ -63,6 +63,9 @@
+      "lp5523:{r,g,b}" (Nokia N900) */
+ #define LED_FUNCTION_STATUS "status"
+
++/* Used for virtual LED groups, multifunction RGB indicators or status LEDs */
++#define LED_FUNCTION_VIRTUAL_STATUS "virtual-status"
++
+ #define LED_FUNCTION_MICMUTE "micmute"
+ #define LED_FUNCTION_MUTE "mute"
+
+--
+2.43.0
