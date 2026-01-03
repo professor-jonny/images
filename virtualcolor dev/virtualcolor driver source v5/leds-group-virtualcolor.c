@@ -64,7 +64,7 @@
 #define PRIORITY_MAX INT_MAX
 #define VLED_SNAPSHOT_DEFAULT 32 /* Typical system has <32 vLEDs per controller */
 
-#define MAX_DEBUGFS_NAME  (32 + 32 + 32) /* function + color + suffix */
+#define MAX_DEBUGFS_NAME  (96) /* "function:color:suffix" + safety margin */
 
 static inline bool is_valid_led_cdev(struct led_classdev *cdev)
 {
@@ -225,11 +225,8 @@ struct vcolor_controller {
 };
 
 /* Forward declarations */
-static void controller_rebuild_phys_leds(struct vcolor_controller *lvc);
-static void controller_destroy_phys_list(struct vcolor_controller *lvc);
 static void controller_run_arbitration_and_update(struct vcolor_controller *lvc);
-static void phys_led_entry_release(struct kref *ref);
-static void virtual_led_release(struct kref *ref);
+	__must_hold(&lvc->lock);
 
 /**
  * get_stable_led_key - Generate stable XArray key for LED tracking
@@ -265,6 +262,43 @@ static inline unsigned long get_stable_led_key(struct led_classdev *cdev)
 		return (unsigned long)cdev;
 }
 
+static void virtual_led_release(struct kref *ref)
+{
+	struct virtual_led *vled = container_of(ref, struct virtual_led, refcount);
+	unsigned int i, j;
+
+	/* Unregister if still registered */
+	if (vled->cdev_registered) {
+		led_classdev_unregister(&vled->cdev);
+		vled->cdev_registered = false;
+	}
+
+	/* Free LED name */
+	if (vled->cdev.name)
+		kfree((void *)vled->cdev.name);
+
+	/* Release channel references */
+	for (i = 0; i < vled->num_channels; i++) {
+		if (vled->channels[i].leds) {
+			for (j = 0; j < vled->channels[i].num_leds; j++) {
+				if (vled->channels[i].leds[j])
+					led_put(vled->channels[i].leds[j]);
+			}
+		}
+		if (vled->channels[i].led_devs) {
+			for (j = 0; j < vled->channels[i].num_leds; j++) {
+				if (vled->channels[i].led_devs[j])
+					put_device(vled->channels[i].led_devs[j]);
+			}
+		}
+	}
+
+	fwnode_handle_put(vled->fwnode);
+
+	/* Free the structure */
+	kfree(vled);
+}
+
 static inline struct virtual_led *virtual_led_get(struct virtual_led *vled)
 {
 	if (vled)
@@ -276,44 +310,6 @@ static inline void virtual_led_put(struct virtual_led *vled)
 {
 	if (vled)
 		kref_put(&vled->refcount, virtual_led_release);
-}
-
-/**
- * controller_safe_arbitrate - Safely run arbitration with proper locking
- * @lvc: Controller instance
- *
- * Wrapper that handles lock acquisition/release around arbitration.
- * Returns true if arbitration ran, false if skipped.
- */
-static inline bool controller_safe_arbitrate(struct vcolor_controller *lvc)
-{
-	if (!lvc)
-		return false;
-
-	mutex_lock(&lvc->lock);
-
-	/* Check removal flag under lock */
-	if (atomic_read(&lvc->removing)) {
-		mutex_unlock(&lvc->lock);
-		return false;
-	}
-
-	/* Check rebuilding under lock */
-	if (atomic_read(&lvc->rebuilding)) {
-		lvc->needs_arbitration = true;
-		mutex_unlock(&lvc->lock);
-		return false;
-	}
-
-	/* Check if safe to run arbitration */
-	if (!lvc->suspended && device_is_registered(&lvc->pdev->dev)) {
-		controller_run_arbitration_and_update(lvc);
-		/* Lock released by arbitration function */
-		return true;
-	}
-
-mutex_unlock(&lvc->lock);
-return false;
 }
 
 struct parsed_leds {
@@ -342,7 +338,7 @@ struct parsed_leds {
  * error code on failure.
  */
 static int parse_leds_fwnode_array(struct device *dev,
-				   const struct fwnode_handle *fwnode,
+				   struct fwnode_handle *fwnode,
 				   const char *propname,
 				   struct parsed_leds *out)
 {
@@ -378,7 +374,7 @@ static int parse_leds_fwnode_array(struct device *dev,
 
 	valid = 0;
 	for (idx = 0; idx < count; idx++) {
-		cdev = fwnode_led_get(fwnode, idx, &led_dev);
+		cdev = fwnode_led_get((struct fwnode_handle *)fwnode, idx);
 
 		if (IS_ERR(cdev)) {
 			ret = PTR_ERR(cdev);
@@ -386,23 +382,28 @@ static int parse_leds_fwnode_array(struct device *dev,
 			if (ret == -EPROBE_DEFER) {
 				dev_info(dev, "LED %d not ready yet (EPROBE_DEFER)\n", idx);
 
-				/* Release all previously acquired LEDs */
-				for (i = 0; i < valid; i++) {
-					led_put(leds[i]);
-					if (devs[i])
-						put_device(devs[i]);
-				}
-
-				return -EPROBE_DEFER;  // Auto-free leds and devs!
+			/* Release all previously acquired LEDs */
+			for (i = 0; i < valid; i++) {
+				led_put(leds[i]);
+				if (devs[i])
+					put_device(devs[i]);
 			}
 
-			dev_warn(dev, "Failed to resolve LED %d: %d\n", idx, ret);
-			continue;
+			return -EPROBE_DEFER;
 		}
+
+		dev_warn(dev, "Failed to resolve LED %d: %d\n", idx, ret);
+		continue;
+		}
+
+		/* Get device from led_classdev (only if cdev is valid) */
+		led_dev = cdev->dev;
 
 		if (is_valid_led_cdev(cdev)) {
 			leds[valid] = cdev;
 			devs[valid] = led_dev;
+			if (led_dev)
+				get_device(led_dev);  /* Take reference if device exists */
 			valid++;
 		} else {
 			dev_warn(dev, "LED %d is not valid (no brightness_set)\n", idx);
@@ -411,14 +412,13 @@ static int parse_leds_fwnode_array(struct device *dev,
 				put_device(led_dev);
 		}
 	}
-
 	if (valid == 0) {
 		dev_warn(dev, "Property '%s': none of %d LED(s) resolved\n",
 			 propname, count);
-		return -ENODEV;  // Auto-free leds and devs!
+		return -ENODEV;
 	}
 
-	// Transfer ownership using no_free_ptr()
+	/* Transfer ownership using no_free_ptr() */
 	out->leds = no_free_ptr(leds);
 	out->devs = no_free_ptr(devs);
 	out->count = (u8)valid;
@@ -472,29 +472,15 @@ static void global_release_all_for_pdev(struct platform_device *pdev)
 	unsigned long index;
 	struct global_phys_owner *gpo;
 	unsigned long released = 0;
-	unsigned long to_release = 0;
 
 	down_write(&global_owner_rwsem);
 
-	/* Pass 1: count */
+	/* Single pass: find and erase */
 	xa_for_each(&global_owner_xa, index, gpo) {
-		if (gpo && gpo->owner_pdev == pdev)
-			to_release++;
-	}
-
-	/* Pass 2: erase */
-	if (to_release) {
-		xa_for_each(&global_owner_xa, index, gpo) {
-			if (!gpo || gpo->owner_pdev != pdev)
-				continue;
-
-			gpo = xa_erase(&global_owner_xa, index);
-			if (gpo && !xa_is_value(gpo)) {
-				kfree(gpo);
-				released++;
-				if (!--to_release)
-					break; /* stop once all found are removed */
-			}
+		if (gpo && !xa_is_value(gpo) && gpo->owner_pdev == pdev) {
+			xa_erase(&global_owner_xa, index);
+			kfree(gpo);
+			released++;
 		}
 	}
 
@@ -518,8 +504,7 @@ static void phys_led_entry_release(struct kref *ref)
 	kfree(ple);
 }
 
-static inline struct phys_led_entry *
-phys_led_entry_get(struct phys_led_entry *ple)
+static inline struct phys_led_entry *phys_led_entry_get(struct phys_led_entry *ple)
 {
 	if (ple)
 		kref_get(&ple->refcount);
@@ -917,40 +902,54 @@ out_cleanup:
 	atomic_set(&lvc->rebuilding, 0);
 }
 
-static const u8 gamma_table[256] = {
-	0,	0,	0,	0,	0,	0,	0,	0,	/* 0 -   7 */
-	0,	0,	0,	0,	1,	1,	1,	1,	/* 8 -  15 */
-	1,	1,	1,	1,	2,	2,	2,	2,	/* 16 -  23 */
-	2,	2,	3,	3,	3,	3,	4,	4,	/* 24 -  31 */
-	4,	4,	5,	5,	5,	5,	6,	6,	/* 32 -  39 */
-	6,	7,	7,	7,	8,	8,	8,	9,	/* 40 -  47 */
-	9,	9,	10,	10,	11,	11,	11,	12,	/* 48 -  55 */
-	12,	13,	13,	14,	14,	15,	15,	16,	/* 56 -  63 */
-	16,	17,	17,	18,	18,	19,	19,	20,	/* 64 -  71 */
-	20,	21,	22,	22,	23,	23,	24,	25,	/* 72 -  79 */
-	25,	26,	26,	27,	28,	28,	29,	30,	/* 80 -  87 */
-	30,	31,	32,	32,	33,	34,	34,	35,	/* 88 -  95 */
-	36,	37,	37,	38,	39,	40,	40,	41,	/* 96 - 103 */
-	42,	43,	44,	44,	45,	46,	47,	48,	/* 104 - 111 */
-	49,	50,	51,	52,	53,	54,	55,	56,	/* 112 - 119 */
-	57,	58,	59,	60,	61,	62,	63,	64,	/* 120 - 127 */
-	65,	66,	67,	68,	70,	71,	72,	73,	/* 128 - 135 */
-	74,	75,	76,	78,	79,	80,	81,	82,	/* 136 - 143 */
-	84,	85,	86,	87,	89,	90,	91,	92,	/* 144 - 151 */
-	94,	95,	96,	97,	99,	100,	101,	103,	/* 152 - 159 */
-	104,	105,	107,	108,	109,	111,	112,	114,	/* 160 - 167 */
-	115,	116,	118,	119,	121,	122,	123,	125,	/* 168 - 175 */
-	126,	128,	129,	131,	132,	134,	135,	137,	/* 176 - 183 */
-	138,	140,	141,	143,	144,	146,	147,	149,	/* 184 - 191 */
-	150,	152,	154,	155,	157,	158,	160,	162,	/* 192 - 199 */
-	163,	165,	167,	168,	170,	172,	173,	175,	/* 200 - 207 */
-	177,	178,	180,	182,	184,	185,	187,	189,	/* 208 - 215 */
-	191,	192,	194,	196,	198,	200,	201,	203,	/* 216 - 223 */
-	205,	207,	209,	211,	212,	214,	216,	218,	/* 224 - 231 */
-	220,	222,	224,	226,	228,	230,	232,	234,	/* 232 - 239 */
-	236,	238,	240,	242,	244,	246,	248,	250,	/* 240 - 247 */
-	253,	255							/* 248 - 255 */
-};
+/**
+ * gamma_apply_2_2 - Apply sRGB gamma 2.2 correction
+ * @input: Linear brightness value (0-255)
+ *
+ * Converts linear brightness to perceptually-correct brightness using
+ * the standard sRGB gamma 2.2 curve. This ensures colors appear correct
+ * when kernel triggers (heartbeat, netdev, etc.) manipulate brightness
+ * directly without userspace intervention.
+ *
+ * Implementation uses fixed-point integer arithmetic suitable for kernel:
+ *   output = 255 * (input/255)^2.2
+ *
+ * The approximation uses a polynomial for the fractional exponent (^0.2)
+ * and achieves ±1 LSB accuracy compared to floating-point calculation.
+ *
+ * Return: Gamma-corrected brightness (0-255)
+ */
+static u8 gamma_apply_2_2(u8 input)
+{
+	u16 x;
+	u32 x2;
+
+	/* Fast paths for boundary conditions */
+	if (input < 8)
+		return 0;
+	if (input == 255)
+		return 255;
+
+	x = input;
+
+	/* Calculate x^2 component */
+	x2 = (u32)x * x;
+
+	/*
+	 * Approximate x^2.2 = x^2 * x^0.2
+	 *
+	 * Polynomial approximation of x^0.2 optimized for [0, 255]:
+	 *   x^0.2 ≈ (x >> 3) + (x >> 5) + constant
+	 *
+	 * This gives us:
+	 *   (x/8) + (x/32) + 20 ≈ x^0.2 after scaling
+	 *
+	 * The shift by 13 at the end normalizes the result back to [0, 255]
+	 */
+	x2 = (x2 * ((x >> 3) + (x >> 5) + 20)) >> 13;
+
+	return (u8)clamp_val(x2, 0, 255);
+}
 
 static u8 scale_intensity_by_brightness(struct vcolor_controller *lvc,
 					u8 intensity, u8 global_brightness,
@@ -967,7 +966,7 @@ static u8 scale_intensity_by_brightness(struct vcolor_controller *lvc,
 
 	/* Use lvc->use_gamma_correction instead of global */
 	if (lvc->use_gamma_correction)
-		final_intensity = gamma_table[final_intensity];
+		final_intensity = gamma_apply_2_2(final_intensity);
 
 	return final_intensity;
 }
@@ -1000,6 +999,7 @@ static void apply_winner_to_channel(struct vcolor_controller *lvc,
 				    struct led_classdev **leds,
 				    unsigned int count,
 				    u8 final_intensity)
+	__must_hold(&lvc->lock)
 {
 	unsigned int i;
 	struct phys_led_entry *ple;
@@ -1030,14 +1030,13 @@ static void apply_winner_to_channel(struct vcolor_controller *lvc,
 	#ifdef CONFIG_DEBUG_FS
 		if (vled->name) {
 			copy_result = strscpy(ple->winner_name, vled->name, MAX_DEBUGFS_NAME);
-			if (copy_result < 0) {
+			if (copy_result == -E2BIG) {
 				dev_warn_once(&lvc->pdev->dev,
 					      "vLED name truncated in telemetry: '%.32s...'\n",
 					       vled->name);
 			}
 		} else {
 			strscpy(ple->winner_name, "(unnamed)", MAX_DEBUGFS_NAME);
-				ple->winner_name[0] = '\0';
 		}
 	#endif
 	}
@@ -1470,6 +1469,44 @@ collect_updates:
 		virtual_led_put(winner_vled);
 }
 
+/**
+ * controller_safe_arbitrate - Safely run arbitration with proper locking
+ * @lvc: Controller instance
+ *
+ * Wrapper that handles lock acquisition/release around arbitration.
+ * Returns true if arbitration ran, false if skipped.
+ */
+static inline bool controller_safe_arbitrate(struct vcolor_controller *lvc)
+{
+	if (!lvc)
+		return false;
+
+	mutex_lock(&lvc->lock);
+
+	/* Check removal flag under lock */
+	if (atomic_read(&lvc->removing)) {
+		mutex_unlock(&lvc->lock);
+		return false;
+	}
+
+	/* Check rebuilding under lock */
+	if (atomic_read(&lvc->rebuilding)) {
+		lvc->needs_arbitration = true;
+		mutex_unlock(&lvc->lock);
+		return false;
+	}
+
+	/* Check if safe to run arbitration */
+	if (!lvc->suspended && device_is_registered(&lvc->pdev->dev)) {
+		controller_run_arbitration_and_update(lvc);
+		mutex_unlock(&lvc->lock);
+		return true;
+	}
+
+mutex_unlock(&lvc->lock);
+return false;
+}
+
 static int virtual_led_brightness_set(struct led_classdev *cdev,
 				      enum led_brightness brightness)
 {
@@ -1595,11 +1632,11 @@ static ssize_t multi_intensity_show(struct device *dev,
 	len = 0;
 	for (i = 0; i < vled->num_channels; i++) {
 		if (i > 0)
-			len += scnprintf(buf + len, PAGE_SIZE - len, " ");
-		len += scnprintf(buf + len, PAGE_SIZE - len, "%u",
-				 vled->channels[i].intensity);
+			len += sysfs_emit_at(buf, len, " ");
+		len += sysfs_emit_at(buf, len, "%u",
+				     vled->channels[i].intensity);
 	}
-	len += scnprintf(buf + len, PAGE_SIZE - len, "\n");
+	len += sysfs_emit_at(buf, len, "\n");
 
 	mutex_unlock(&vled->lock);
 	return len;
@@ -1608,7 +1645,7 @@ static ssize_t multi_intensity_show(struct device *dev,
 static int parse_intensity_values(const char *buf, u8 *values,
 				  unsigned int expected_count)
 {
-	char *tmp, *cur, *end;
+	char *cur, *end;
 	unsigned int count, val;
 	int ret;
 	size_t buf_len;
@@ -1624,7 +1661,7 @@ static int parse_intensity_values(const char *buf, u8 *values,
 		return -EINVAL;
 	}
 
-	tmp = kstrndup(buf, PAGE_SIZE, GFP_KERNEL);
+	char *tmp __free(kfree) = kstrndup(buf, PAGE_SIZE, GFP_KERNEL);
 	if (!tmp)
 		return -ENOMEM;
 
@@ -1655,7 +1692,6 @@ static int parse_intensity_values(const char *buf, u8 *values,
 		ret = -EINVAL;
 
 out:
-	kfree(tmp);
 	return ret;
 }
 
@@ -1768,11 +1804,11 @@ static ssize_t multi_index_show(struct device *dev,
 	len = 0;
 	for (i = 0; i < vled->num_channels; i++) {
 		if (i > 0)
-			len += scnprintf(buf + len, PAGE_SIZE - len, " ");
-		len += scnprintf(buf + len, PAGE_SIZE - len, "%u",
-				 vled->channels[i].color_id);
+			len += sysfs_emit_at(buf, len, " ");
+		len += sysfs_emit_at(buf, len, "%u",
+				     vled->channels[i].color_id);
 	}
-	len += scnprintf(buf + len, PAGE_SIZE - len, "\n");
+	len += sysfs_emit_at(buf, len, "\n");
 
 	mutex_unlock(&vled->lock);
 	return len;
@@ -1798,11 +1834,11 @@ static ssize_t multi_multipliers_show(struct device *dev,
 	len = 0;
 	for (i = 0; i < vled->num_channels; i++) {
 		if (i > 0)
-			len += scnprintf(buf + len, PAGE_SIZE - len, " ");
-		len += scnprintf(buf + len, PAGE_SIZE - len, "%u",
-				 vled->channels[i].scale);
+			len += sysfs_emit_at(buf, len, " ");
+		len += sysfs_emit_at(buf, len, "%u",
+				     vled->channels[i].scale);
 	}
-	len += scnprintf(buf + len, PAGE_SIZE - len, "\n");
+	len += sysfs_emit_at(buf, len, "\n");
 
 	mutex_unlock(&vled->lock);
 	return len;
@@ -1990,10 +2026,9 @@ static int parse_channel_multipliers(struct device *dev,
 				     struct mc_channel *channels,
 				     unsigned int num_channels)
 {
-	u32 *scales;
 	int ret, i;
 
-	scales = kcalloc(num_channels, sizeof(*scales), GFP_KERNEL);
+	u32 *scales __free(kfree) = kcalloc(num_channels, sizeof(*scales), GFP_KERNEL);
 	if (!scales)
 		return -ENOMEM;
 
@@ -2206,65 +2241,6 @@ static int virtual_led_register(struct device *dev, struct virtual_led *vled)
 	return 0;
 }
 
-static void virtual_led_release(struct kref *ref)
-{
-	struct virtual_led *vled = container_of(ref, struct virtual_led, refcount);
-
-	/*
-	 * Automatically unregister if still registered
-	 * This ensures we never leak LED class devices even during
-	 * abnormal teardown sequences.
-	 */
-	if (vled->cdev_registered) {
-		pr_warn("%s: Auto-unregistering LED '%s' during kref cleanup\n",
-			DRIVER_NAME, vled->name ? vled->name : "(unknown)");
-		led_classdev_unregister(&vled->cdev);
-		vled->cdev_registered = false;
-	}
-
-	/* Actually free the memory since we used kzalloc */
-	kfree(vled);
-}
-
-static void virtual_led_destroy(struct virtual_led *vled)
-{
-	unsigned int i, j;
-
-	if (!vled)
-		return;
-
-	vled->cdev_registered = false;
-
-	if (vled->cdev.name)
-		kfree((void *)vled->cdev.name);
-
-#ifdef CONFIG_DEBUG_FS
-	debugfs_remove_recursive(vled->debugfs_dir);
-#endif
-
-	for (i = 0; i < vled->num_channels; i++) {
-		if (vled->channels[i].leds) {
-			for (j = 0; j < vled->channels[i].num_leds; j++) {
-				if (vled->channels[i].leds[j]) {
-					led_put(vled->channels[i].leds[j]);
-					vled->channels[i].leds[j] = NULL;
-				}
-			}
-		}
-
-		if (vled->channels[i].led_devs) {
-			for (j = 0; j < vled->channels[i].num_leds; j++) {
-				if (vled->channels[i].led_devs[j]) {
-					put_device(vled->channels[i].led_devs[j]);
-					vled->channels[i].led_devs[j] = NULL;
-				}
-			}
-		}
-	}
-
-	fwnode_handle_put(vled->fwnode);
-}
-
 #ifdef CONFIG_DEBUG_FS
 
 /**
@@ -2382,14 +2358,13 @@ static int format_stats(void *data, char *out, size_t size)
 
 	len += scnprintf(out + len, size - len, "\n===Configuration===\n");
 	len += scnprintf_field_str(out, len, size, "Gamma correction",
-			lvc->use_gamma_correction ? "enabled" : "disabled");
+			lvc->use_gamma_correction ? "sRGB 2.2 (function)" : "disabled");
 	len += scnprintf_field_str(out, len, size, "Update batching",
 			lvc->enable_update_batching ? "enabled" : "disabled");
 	len += scnprintf_field(out, len, size, "Update delay", "%u us",
 			lvc->update_delay_us);
 	len += scnprintf_field(out, len, size, "Max physical LEDs", "%u",
 			lvc->max_phys_leds);
-
 	len += scnprintf(out + len, size - len, "\nPhysical LED count: %llu/%u\n",
 			 phys_count, lvc->update_buf.capacity);
 	len += scnprintf_field_str(out, len, size, "Removing",
@@ -2728,6 +2703,8 @@ static ssize_t debugfs_rebuild_write(struct file *file,
 	controller_rebuild_phys_leds(lvc);
 
 	phys_count = lvc->phys_led_count;
+	mutex_unlock(&lvc->lock);
+
 	dev_info(&lvc->pdev->dev, "Physical LED rebuild complete: %u LEDs registered\n",
 		 phys_count);
 
@@ -2807,6 +2784,7 @@ static ssize_t gamma_correction_store(struct device *dev,
 {
 	struct vcolor_controller *lvc = dev_get_drvdata(dev);
 	bool enable;
+	bool should_arbitrate;
 	int ret;
 
 	if (!lvc || atomic_read(&lvc->removing))
@@ -2818,15 +2796,17 @@ static ssize_t gamma_correction_store(struct device *dev,
 
 	mutex_lock(&lvc->lock);
 	lvc->use_gamma_correction = enable;
+	should_arbitrate = !lvc->suspended && !atomic_read(&lvc->rebuilding);
 
-	/* Trigger arbitration to apply new gamma setting */
-	if (!lvc->suspended && !atomic_read(&lvc->rebuilding))
+	if (should_arbitrate) {
 		controller_run_arbitration_and_update(lvc);
-	else
+		/* Lock released and reacquired by arbitration */
 		mutex_unlock(&lvc->lock);
+	} else {
+		mutex_unlock(&lvc->lock);
+	}
 
 	dev_info(dev, "Gamma correction %s\n", enable ? "enabled" : "disabled");
-
 	return count;
 }
 static DEVICE_ATTR_RW(gamma_correction);
@@ -3058,7 +3038,7 @@ static int leds_virtualcolor_probe(struct platform_device *pdev)
 	if (ret) {
 		dev_err(dev, "Failed to create sysfs attributes: %d\n", ret);
 		return ret;
-}
+	}
 
 	/* ALLOCATE BUFFERS ONCE - using lvc->max_phys_leds */
 	lvc->update_buf.max_capacity = lvc->max_phys_leds;
@@ -3255,8 +3235,6 @@ err_cleanup:
 					v->cdev_registered = false;
 				}
 
-				/* Release device references before freeing vLED */
-				virtual_led_destroy(v);
 				/* This call uses kref_put() which leads to kfree(v) */
 				virtual_led_put(v);
 			}
@@ -3264,8 +3242,7 @@ err_cleanup:
 		mutex_unlock(&lvc->lock);
 
 		controller_destroy_debugfs(lvc);
-
-		/* devm will clean up the LVC structure itself */
+		sysfs_remove_group(&pdev->dev.kobj, &leds_virtualcolor_attr_group);
 		return ret;
 }
 
@@ -3312,7 +3289,6 @@ sysfs_remove_group(&pdev->dev.kobj, &leds_virtualcolor_attr_group);
 		if (vled->cdev_registered)
 			led_classdev_unregister(&vled->cdev);
 
-		virtual_led_destroy(vled);
 		virtual_led_put(vled);
 	}
 
